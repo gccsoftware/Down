@@ -1,0 +1,140 @@
+name: Migrate Releases from Source Repo
+
+# 手动触发：在 Actions 页面点击 "Run workflow"，填入源仓库即可
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源仓库，格式 owner/repo，例如 original-owner/repo'
+        required: true
+      limit:
+        description: '最多迁移多少个 release（默认 100）'
+        required: false
+        default: '100'
+
+# 创建 release 需要 contents: write 权限
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    env:
+      # 目标仓库（即运行该 workflow 的当前仓库，自动获取，无需手填）
+      TARGET_REPO: ${{ github.repository }}
+      SOURCE_REPO: ${{ inputs.source_repo }}
+      LIMIT: ${{ inputs.limit }}
+      # 目标仓库写入用的 token，Actions 自动注入，无需配置
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 如果源仓库是私有仓库、且不是你自己账号下的，
+      # 需要在 Settings -> Secrets -> Actions 中新增一个具有 repo 读权限的 PAT，
+      # 命名为 SOURCE_REPO_TOKEN；源仓库是公开仓库则可以不配置，会自动回退用 GITHUB_TOKEN。
+      SOURCE_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: 迁移所有 releases
+        run: |
+          set -euo pipefail
+
+          echo "源仓库: $SOURCE_REPO"
+          echo "目标仓库: $TARGET_REPO"
+
+          # 读取源仓库信息时用的 token：优先用 SOURCE_TOKEN，没配置就回退用当前仓库的 GITHUB_TOKEN
+          SRC_TOKEN="${SOURCE_TOKEN:-$GH_TOKEN}"
+
+          WORKROOT="$(mktemp -d)"
+
+          # 拉取源仓库所有 release 的 tag 列表（按发布时间升序，先迁移旧的，顺序更自然）
+          tags=$(GH_TOKEN="$SRC_TOKEN" gh release list \
+            --repo "$SOURCE_REPO" \
+            -L "$LIMIT" \
+            -O asc \
+            --json tagName -q '.[].tagName')
+
+          if [ -z "$tags" ]; then
+            echo "源仓库没有任何 release，结束。"
+            exit 0
+          fi
+
+          echo "$tags"
+
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "=================================================="
+            echo "处理 tag: $tag"
+
+            workdir="$WORKROOT/$tag"
+            mkdir -p "$workdir/assets"
+
+            # 目标仓库已存在同名 release：不再简单跳过，
+            # 而是进一步比对资源文件列表，只补传缺失的部分，
+            # 这样即使上次运行中途被打断（比如某个大文件上传失败），
+            # 重新运行也能把没传完的文件补齐，而不会重复上传已存在的文件。
+            if gh release view "$tag" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+              src_assets=$(GH_TOKEN="$SRC_TOKEN" gh release view "$tag" \
+                --repo "$SOURCE_REPO" --json assets -q '.assets[].name' | sort)
+              dst_assets=$(gh release view "$tag" \
+                --repo "$TARGET_REPO" --json assets -q '.assets[].name' | sort)
+
+              missing=$(comm -23 <(echo "$src_assets") <(echo "$dst_assets") | sed '/^$/d')
+
+              if [ -z "$missing" ]; then
+                echo "release $tag 已存在且资源完整，跳过。"
+                continue
+              fi
+
+              echo "release $tag 已存在，但缺少以下资源，将补传："
+              echo "$missing"
+
+              # 只下载缺失的那几个文件（用 -p 精确匹配文件名逐个下载），避免整包重下
+              while IFS= read -r fname; do
+                [ -z "$fname" ] && continue
+                GH_TOKEN="$SRC_TOKEN" gh release download "$tag" \
+                  --repo "$SOURCE_REPO" \
+                  -D "$workdir/assets" \
+                  -p "$fname"
+              done <<< "$missing"
+
+              gh release upload "$tag" "$workdir/assets"/* --repo "$TARGET_REPO"
+              echo "release $tag 缺失资源补传完成"
+              continue
+            fi
+
+            # 获取该 release 的元数据（标题、正文、草稿/预发布状态）
+            GH_TOKEN="$SRC_TOKEN" gh release view "$tag" \
+              --repo "$SOURCE_REPO" \
+              --json name,body,isDraft,isPrerelease \
+              > "$workdir/meta.json"
+
+            title=$(jq -r '.name // empty' "$workdir/meta.json")
+            is_draft=$(jq -r '.isDraft' "$workdir/meta.json")
+            is_prerelease=$(jq -r '.isPrerelease' "$workdir/meta.json")
+            jq -r '.body // ""' "$workdir/meta.json" > "$workdir/notes.md"
+
+            # 下载该 release 下所有资源文件；如果这个 release 本身没有附带任何资源
+            # （只有源码包），命令会报错，用 || true 容错，不影响后续创建 release
+            GH_TOKEN="$SRC_TOKEN" gh release download "$tag" \
+              --repo "$SOURCE_REPO" \
+              -D "$workdir/assets" || true
+
+            create_args=(release create "$tag"
+              --repo "$TARGET_REPO"
+              --title "${title:-$tag}"
+              --notes-file "$workdir/notes.md")
+
+            [ "$is_draft" = "true" ] && create_args+=(--draft)
+            [ "$is_prerelease" = "true" ] && create_args+=(--prerelease)
+
+            if [ -n "$(ls -A "$workdir/assets" 2>/dev/null)" ]; then
+              gh "${create_args[@]}" "$workdir/assets"/*
+            else
+              gh "${create_args[@]}"
+            fi
+
+            echo "release $tag 迁移完成"
+          done <<< "$tags"
+
+          echo "全部 release 迁移完成。"
